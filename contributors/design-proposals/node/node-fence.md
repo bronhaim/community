@@ -11,9 +11,33 @@ Current Repository: https://github.com/rootfs/node-fencing
 Rationale and architecture for the addition of a fencing mechanism in Kubernetes clusters. In [pod-safety](https://github.com/kubernetes/community/blob/16f88595883a7461010b6708fb0e0bf1b046cf33/contributors/design-proposals/pod-safety.md) proposal we describe the need and desire solutions for unrecoverable cluster partition. In the following we define motivations and flows to provide fence actions using fence controller to free the partitioned entities and recover the workload by isolation and power management operations.
 
 ### Motivation
-Kubernetes cluster can get into a network partition state between nodes to the api server running on the master node (e.g. network device failure). When that happens their nodes’ status is changed to “not ready” by the node controller and the scheduler cannot know the status of pods running on that node without reaching the nodes’ kubelet service. From such scenario, k8s (since 1.8) defines an eviction timeout (forced by the node controller) such that after 5 minutes pods will enter a termination state in the api server and will try to shutdown gracefully when possible (this happens only if the connectivity returns).
+Kubernetes cluster can get into a network partition state between nodes to the apiserver
+running on the master node (e.g. network device failure).
+When that happens their nodes’ status is changed to “not ready” by the node controller
+and the scheduler cannot know the status of pods running on that node without reaching
+the nodes’ kubelet service. From such scenario, k8s (since 1.8) defines an eviction timeout
+(forced by the node controller) such that after 5 minutes pods will enter a termination
+state in the apiserver and will try to shutdown gracefully when possible (this happens
+only if the connectivity returns).
 
-If the pod belongs to a ReplicaSet, once the termination state is set, the ReplicaSet controller will immediately start another instance of that pod.  However when the pod is part of a StatefulSet, the StatefulSet controller won’t start new instance of that pod until the kubelet responds with the pod’s status. This is because there is a permanent association between a StatefulSet member and its storage.  Not waiting would potentially result in multiple copies of a member, all writing to the same volume (leading to corruption or worse).
+If the pod belongs to a ReplicaSet, once the termination state is set, the ReplicaSet
+controller will immediately start another instance of that pod.
+However when the pod is part of a StatefulSet, the StatefulSet controller won’t start
+new instance of that pod until the kubelet responds with the pod’s status.
+This is because there is a permanent association between a StatefulSet member and
+its storage. Not waiting would potentially result in multiple copies of a member,
+all writing to the same volume (leading to corruption or worse).
+
+TODO: a pod needs an AWS volumes which claims it mounted on a node but it is actually not.
+So we need to restart the node so the volume is properly detached from the node
+and can be properly attached on a different node.
+
+TODO: node resource consumed by a node daemon or a container runtime environment may
+grow over time without any visible reason (e.g. faulty garbage collector in Go runtime environments
+or a container runtime environment loosing a memory/not releasing i-nodes) which can
+eventually exhaust some of the available resource causing a node to be inoperable.
+Restarting a node can help to re-claim the resources.
+
 
 ### Cloud deployments
 When k8s is deployed on a cloud such as AWS or GCE, the autoscaler uses the Cloud Provider APIs to recognize unhealth nodes and effectively bounding the amount of time the node will stay in the “not ready” state until the node-controller removes the node (if possible, kernel panic can't be handled that way), and how long the scheduler will need to wait before it can safely start the pod elsewhere.
@@ -23,27 +47,40 @@ This is particularly problematic because all StatefulSet scaling events (up and 
 ### Scope of this proposal
 We cover isolation (storage-fence, cluster isolation) and power-management (rebooting the node’s machine) actions while node is partitioned from cluster until it becomes responsive again.
 We don’t cover:
-- HA applications
-- Collaborative storage based fencing (e.g. sanlock)
-- Network fencing
+* HA applications
+* Collaborative storage based fencing (e.g. sanlock)
+* Network fencing
 
 We assume:
-- Containers that lose access to network and/or storage will self terminate (important for environments relying on network and/or storage fencing)
-- With isolating the node we benefit by allowing quicker and intensive actions when node that runs stateful applications becomes unreachable. 
+* Containers that lose access to network and/or storage will self terminate (important for environments relying on network and/or storage fencing)
+* With isolating the node we benefit by allowing quicker and intensive actions when node that runs stateful applications becomes unreachable.
+
+NOTE: We need to reflect that in the Roadmap, something like first we concentrate purely on the power management operations but we plan to extend the supported fencing/isolation to other areas like the storage fencing.
 
 ### Solution proposal
-To address this we propose the addition of the fence controller which, in the event of a node-level connectivity failure, signals to a new fencing executor that isolates the affected node and notifies the apiserver that it is safe to continue recovery.
+To address this we propose the addition of the fence controller which, in the event
+of a node-level failure, signals to a new fencing executor to isolate the affected node
+and notifies the apiserver that it is safe to continue recovery.
 
-This functionality, if configured by the admin, applies exclusively to nodes running StatefulSets as they are currently the only construct that provides at-most-one semantics for its members.  In the absence of this feature, an end-user has no ability to safely or reliably allow StatefulSets to be recovered and as such end-users will not be provided with a mechanism to enable/disable this functionality on a set-by-set basis.
+This functionality, if configured by the admin, is absolutely necessary for nodes running
+StatefulSets as they are currently the only construct that provides at-most-one
+semantics for its members.  In the absence of this feature, an end-user has no ability
+to safely and/or reliably allow StatefulSets to be recovered and as such end-users
+will not be provided with a mechanism to enable/disable this functionality on a set-by-set basis.
 
 Depending on the deployment, the fencing executors will have capabilities such as:
-- Power management fencing: powering off\on\rebooting a node
-- Storage fencing: disconnection from specific storage to prevent multiple writers, and unfence when connectivity retuned
-- Cluster fence: Cordon node, removing node wordload from api server
+* Power management fencing: powering off\on\rebooting a node
+* Storage fencing: disconnection from specific storage to prevent multiple writers, and unfence when connectivity is restored
+* Cluster fence: Cordon node, removing node workload from apiserver
 
-Once the node has been made safe by using one or more of the fencing mechanisms listed above, we can know that either the pods are not running anymore or are not accessing shared resources (storage or network) and we can safely delete their objects from the api server to allow the scheduler to initiate new instance.
+Once the node has been made safe/isolated by using one or more of the fencing mechanisms listed above,
+we can know that either the pods are not running anymore or they are not accessing shared
+resources (storage or network) and we can safely delete their objects from the apiserver
+to allow the scheduler to initiate new instance.
 
-The design and implementation acknowledge that other entities, such as the autoscaler, are likely to be present and performing similar monitoring and recovery actions. Therefore it is critical that the fencing controller not create or be susceptible to race conditions.
+The design and implementation acknowledge that other entities, such as the autoscaler,
+are likely to be present and performing similar monitoring and recovery actions.
+Therefore it is critical that the fencing controller does not create or be is not susceptible to race conditions.
 
 ## User experience
 The loss of a worker node should be transparent to user's of StatefulSets. Recovery time for affected Pods should be bounded and short, allowing scale up/down events to proceed as normal afterwards.
@@ -57,96 +94,263 @@ In the absence of this feature, an end-user has no ability to safely or reliably
 
 In other words, the failure of a worker node should not represent a single point of failure for StatefulSets.
 
+TODO: Pods on a node providing a service can suffer from a network malfunction caused be an incorrectly functioning
+network utilities on a node. Rebooting a node can fix the issue.
+
 ## Admin experience
+
 ### Configurations required
-- How to trigger fence devices/apis - general template parameters (e.g. cluster UPS address and credentials) and overrides values per node for specific fields (e.g. ports related to node)
-- How to run a fence flow for each node (each node can be attached to several fence devices\apis and the fence flow can defer)
+* How to trigger fence devices/apis - general template parameters (e.g. cluster UPS address and credentials) and overrides values per node for specific fields (e.g. ports related to node)
+* How to run a fence flow for each node (each node can be attached to several fence devices\apis and the fence flow can defer)
 
-The following is stored in `ConfigMap` objects:
+TODO: we can see a set of nodes as a set of containers. Each time an application crushes or a running process makes underlying container
+un-operable, the container is restarted or recreated. We want the same to be done for the nodes. Each time there is an issue causing
+a node to misbehave, we need to perform suitable actions so the node is forced back to conforming behavior automatically without a SRE intervention.
 
-#### Node Fence Config
-For each node that supports fencing we will configure NodeFenceConfig - This object is needed to centralize the information about “how” the node can be “fenced” from the cluster - we will have 3 steps for fence “isolation”, “power-management”, “recovery”. In each we will have a list of methods to perform.
+## Node auto-repair mechanism
 
-Note: 
+Cloud providers such as AWS or GCE expose a cloud API through which a fencing action can be performed.
+Usually, only AWS credentials and an instance name are required to access the AWS API. The same holds for GCE.
+On the other hand, bare-metal provider requires knowledge of hardware specific parameters.
+Such as Eaton PDU parameters to perform power management actions or switch brocade parameters
+to disconnect a node from the network.
+
+From the point of view of the fence controller, the node name is the only parameter
+required to perform a fencing action. Thus, it is important to abstract from a specific
+cloud provider requirements and build a layer through which the fencing actions are perform.
+E.g. for AWS one can run a thread that communicates with the AWS cloud API,
+for bare metal deploy a pod with hardware specific configuration.
+
+In general, each node auto-repair operation can be modeled as a sequence of transitions
+between states (e.g. ``bad node detected``, ``node queued``, ``node isolated``), each transition
+possibly triggering a fence action. E.g. transition from ``node queued`` to ``node isolated``
+can trigger network isolation.
+
+**Example**: when a node problem detector reports crashes of applications due to unaccessible AWS volume the fence controller may:
+
+```
+1. Mark node unschedulable
+2. Remove resources of all pods that suffer from the crashes and/or has the AWS volume mounted
+3. Detach the AWS volume (in case it is attached)
+4. Restart a node
+5. Mark the node schedulable again
+```
+
+In case a node auto-repair operation is interrupted (either due to controller crash or a node failure),
+we need a reliable way to store the last state of the operation so the fence flow can be resumed
+once a new fence controller is up and running.
+Given a controller should/must be stateless, we need to store the states
+outside of the controller. Either as a node annotation or via new crd (custom resource definition).
+
+### Cluster fence policies
+Fencing policy allows each cluster to behave differently in case of connectivity issues.
+One of the main motivation for that is to prevent “fencing storms” from happening,
+but there are others. The controller is responsible for forcing the fence policy.
+
+Fencing storm is a situation in which fencing for a few nodes in the cluster
+is triggered at the same time, due to an environmental issue.
+
+Some ways to prevent fencing storms:
+* Skip fencing if select % of hosts in cluster is non-responsive (will help for issue #2 above)
+* Skip fencing if detected the host cannot connect to storage.
+
+**Examples**:
+
+1. Switch failure - a switch used to connect a few nodes to the environment is failing,
+and there is no redundancy in the network environment. In such a case,
+the nodes will be reported as unresponsive, while they are still alive and kicking,
+and perhaps providing service through other networks they are attached to.
+If we fence those nodes, a few services will be offline until restarted,
+while it might not have been necessary.
+
+2. Management system network failure - if the management system has connectivity issues,
+it might cause it to identify that nodes are unresponsive,
+while the issue is with the management system itself.
+
+3. In some cases the AWS volume can not be dettached or only some of the affected pods can be
+deleted (e.g. due to disruption budget limitations). Thus, some fence policies may be applied:
+* Limit the number of resources (e.g. pods) deleted per unit of time
+* Respect disruption budget (e.g. remove the pods from a node via the proper endpoint) (NOTE: this may be already implemented in the Delete request)
+* Process only one node at a given time to minimize disruption of the cluster (e.g. in case other nodes are still providing services)
+
+
+## Implementation
+
+### Fence Controller
+The fence controller is a stateless controller (state automaton) that can be deployed
+as a pod in a cluster or a process running outside the cluster.
+The controller identifies unresponsive node by getting events from the apiserver.
+Once the node misbehaves (e.g. becomes “not ready”) the controller initiates a fence flow.
+
+The controller is defined as a n-tuple (S, T, r, new, F), where `S` denotes a set of states,
+`T` a set of fence steps, `r` stands for a transition function, ``new`` is its initial state
+and ``F`` a set of final states.
+
+The set `S` consists of:
+
+* ``new``: a node gets into the state in a moment it starts misbehaving (e.g. node reporting `Unready` status)
+* ``running``: a node is isolated and ready for power management actions
+* ``done``: a node is ready for recovery
+* ``final``:  node is repaired and joined back to the cluster
+* ``error``: either of the fence steps failed
+
+The transition function ``r`` is defined as:
+
+* When a node is in the ``new`` state for a specified number of times units,
+the ``isolation`` step is triggered. Once the step is completed,
+the node transitions to the ``running`` state. In case the step is not completed,
+the node transitions to the ``error`` state.
+
+* When a node is in the ``running`` state, check if the node status is ``Ready``.
+If it is, node transitions to the ``done`` state.
+Otherwise the ``power-management`` step is triggered.
+If the step fails, the node transitions to the ``error`` state. Otherwise
+the node transitions to the ``done`` state.
+
+* When a node is in the ``done`` state, check the node status. If the status is
+``Ready``, run the ``recovery`` step. Otherwise, transition to the ``error`` state.
+If the ``recovery`` step is completed, move the the ``final`` state. Otherwise,
+transition to the ``error`` state.
+
+If a fence step fails, it can be retried a configurable number of times before
+the node transitions into the ``error`` state.
+
+If a node gets into the ``error`` state, entire fencing flow is restarted and the
+node is moved to the ``new`` state. The number of restarts is configurable as well.
+
+| Fence controller state transitions |
+|:--:|
+| ![Fencing controller automaton](node-fence-automaton.png "Fence controller state transitions") |
+
+TODO: add arrows (if node ready -> move to done)
+TODO: The fence controller(s) should run on the master nodes (as it is more secure).
+
+### Provider specific fence agents
+
+The fence agents is a component that implements the actual fencing action.
+In case of AWS environment, the implementations reduces to sending a request
+to AWS cloud provider API and waiting for a response.
+In case of bare-metal it may correspond to running a Pod pulling an image
+providing all functionality needed to reboot or to isolate a node. Then waiting
+for the pod to finish.
+In both cases if the fencing action fails, the controller may retry the action
+before it changes its state to failed.
+
+Node: fencing action is a general expression that does not refer to a specific
+implementation (e.g. a sequence of fencing methods)
+
+In any case, complexity of running a single fencing action should be hidden
+in specific implementation so the fence controller is independent of a provider
+and it is easy to extend the list of supported cloud providers with new ones.
+
+Currently, the following cloud providers are identified:
+* AWS
+* GCE
+* OpenStack
+* Azure
+* WmWare
+
+NOTE: the list is not to be a complete enumeration of all available providers
+
+Each fence agent needs to know how to access a specific cloud provider API and
+what parameters are needed to perform selected action.
+There are multiple ways how to provide such parameters to each agent.
+Either to specify per node configuration that each agent can read or
+to read all the parameters from a centralized location and inject them into
+fence agent. In either case we need to minimize the agent configuration
+complexity.
+
+By default, there is no explicit configuration needed.
+It is assumed only cloud provider credentials and a node instance name
+are required. In case more parameters are needed to perform a fencing action,
+they can be set in the fence controller configuration (in case they are common
+for all nodes) or via ``ConfigMap`` for a specific node (or a set of nodes).
+
+In our proposal each fencing action is implemented as a sequence of fencing
+methods (e.g. restart AWS instnace, turn PDU on/off, network switch on/off).
+
+In the default case (e.g. for AWS), the configuration could look like:
+
 ```yaml
 - kind: ConfigMap
   apiVersion: v1
   metadata:
-   name: fence-config-host1
+   name: fence-config-[NODE_NAME]
   data:
    config.properties: |-
-    node_name=host1
+    node_name=[NODE_NAME]
+    isolation=mark-unschedulable
+    power_management=restart-instance
+    recovery=mark-unschedulable
+```
+
+Given this configuration is default, it does not have to be specified at all.
+Though it can be overrided by a specific one.
+
+For the bare-metal provider the node fence configuration could be specified as:
+
+```yaml
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+   name: fence-config-[NODE_NAME]
+  data:
+   config.properties: |-
+    node_name=[NODE_NAME]
     isolation=fc-off
     power_management=eaton-off eaton-on
     recovery=fc-on
+   fence-method-fc-on: |-
+    template=fence-method-template-fc-switch-brocade
+    plug=2
+    action=on
+   fence-method-fc-off: |-
+    template=fence-method-template-fc-switch-brocade
+    plug=2
+    action=off
+   fence-method-eaton-on: |-
+    template=fence-method-template-eaton-pdu
+    plug=1
+    action=on
+   fence-method-eaton-off: |-
+    template=fence-method-template-eaton-pdu
+    plug=1
+    action=off
 ```
-Notes:
-- To keep those fence configuration we had two options - Adding attributes in metadata section to the existing node object or create ConfigMap that describe this information for each node with fencing options.
-- Each configmap relates to specific node name.
-- Isolation\power_managment\recovery are parameters with list value which represent the method to run in each step of the fencing.
-- Tha name of the configmap must be "fecne-config-[NODE_NAME]"
 
-#### Fence Method Config ###
-Represents the fence method parameters. This is done by configuring a “template” and specific config for each node with overloaded values.
-- Template is an abstract structure for a fence method (see examples below for fc_switch device).
-- For each template the admin can create specific method config with different properties’ values.
-The template allows to reuse parameters for common devices and agents
+The fence node configuration file centralizes the information about “how” the node can be “fenced” from the cluster.
+In general, it consists of 3 fencing steps: “isolation”, “power-management” and “recovery”.
+Each step specifying a sequence of methods.
+Each fence method is an instance of a fencing template that allows to reuse parameters for common devices.
+Check [examples](node-fencing-examples) to see some of the templates.
+
+#### Fallback mechanism
+
+More specific node fence configuration is always preferred to a more general one:
+
+* Default node fence configuration (no ``ConfigMap`` name)
+* Per set-of-nodes fence configuration (``fence-config-type-[TYPE_LABEL_VALUE]``)
+* Per node fence configuration (``fence-config-node-[NODE_NAME]``)
+
+Currently, only `type` label is supported.
+
+E.g.
+
 ```yaml
-# This fence-method uses the fc-switch-brocade template and adds the plug number for host0,
-# when executor reads fence-method-fc-on-host0 for host0, it will also search for the
-# conigmap template to add its parameters to the action.
-# The name of each fence method must be fence-method-[method_name]-[node_name]
 - kind: ConfigMap
   apiVersion: v1
   metadata:
-   name: fence-method-fc-on-host0
-   namespace: default
+   name: fence-config-type-compute
   data:
-   method.properties: |-
-          template=fence-method-template-fc-switch-brocade
-          plug=2
-
-# This tamplate configmap for fc-swtich-brocase. The name of templates must be fence-method-template-[method_name]
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-template-fc-switch-brocade
-   namespace: default
-  data:
-   template.properties: |-
-          name=fc_switch_brocade
-          agent_name=fence_brocade
-          ipaddr=192.168.1.2
-          password=brocade_password
-          username=brocade_admin
+   ...
 ```
 
-### Implementation
-#### Fence Controller
-The fence controller is a stateless controller that can be deployed as pod in cluster or process running outside the cluster. The controller identifies unresponsive node by getting events from the apiserver, once node becomes “not ready” the controller posts crd for fence to initiate fence flows.
+overrides the default node fence configuration of all nodes with `type=compute` label
+unless more specific ``fence-config-node-[NODE_NAME]`` is available.
 
-The controller proidically polls fencenode crds and manage them as follow:
-- status:new - Controller creates job objects for each method in step, move to status:running and update jobs list in nodefence object.
-- status:running - Poll running jobs and check if all done successfully. Set status:done or status:error based on jobs condition.
-- status:done - Check node readiness, if node is ready move to step:recovery. If node still unresponsive, move to step:power-management. If on step:power-management already and not ready move to status:error (move to error after configurable number of pollings before changing status - see cluster-fence-config)
-- status:error - Delete all related jobs and move to status:new to retrigger jobs on different nodes.
+### Fence CRD
+This is new proposed crd object in k8s cluster API server. The idea behind is:
 
-Job creation gets the authenticatoin parameters to execute fence agent - This is parsed by the controller from the configmaps as described above. On init the controller reads all fence agents' meta-data to perform parameters extraction for creating the job command. New fence-scripts can be dynamically added by dropping scripts to fence-agents folder and rebuilt the agent image.
-
-#### Executor Job
-Executor is k8s Job that is posted to cluster by the controller. The job is based on centos image including all fence scripts that are available in cluster. The job only executes one command and returns the exit status. The job is monitored and mantained by the controller as described in Fence Controller section.
-Follwing is a list of agents we will integrate using fence scripts:
-- Cluster fence operation - E.g: 1) cordon node 2) cleaning resources - deleting pods from apiserver.
-- https://github.com/ClusterLabs/fence-agents/tree/master/fence/agents/aws - Cloud provider agent for rebooting ec2 machines.
-- https://github.com/ClusterLabs/fence-agents - Scripts for executing pm devices.
-- https://github.com/ClusterLabs/fence-agents/blob/master/fence/agents/compute/fence_compute.py - Fence agent for the automatic resurrection of OpenStack compute instances.
-- https://github.com/ClusterLabs/fence-agents/tree/master/fence/agents/vmware_soap - Cloud provider agent for rebooting vmware machines.
-- https://github.com/ClusterLabs/fence-agents/tree/master/fence/agents/rhevm - Cloud provider agent for rebooting oVirt hosts.
-
-Cloud provider allows us to implement fencing agents that perform power management reboot. In k8s autoscaler implementation the concept of cloud provider is already [implemented](https://github.com/kubernetes/kubernetes/tree/master/pkg/cloudprovider) - we might integrate with that code to support PM operations over AWS and GCE.
-
-#### Fence CRD
-This is new proposed crd object in k8s cluster API server. The idea behind it is: 
 1. to allow the fence controller to be “stateless” - means that the crd will hold the fence operation state and if controller was restarted all the info to continue fence operation will be specified in those objects.
 1. to allow triggering jobs to perform actions and sign if they finished successfully or failed.
 
@@ -170,15 +374,15 @@ retries: 2
 status: Done
 step: Power-Management
 ```
-- step can be isolation\power_managment\recover - this refer to the set of method configured in the NodeFenceConfig.
-- status is new, done, running or error - see Fence Controller management for each status.
+- step can be isolation\power_managment\recover - this refer to the set of methods configured in the node fence configuration.
+- status is new, done, running, final or error - see Fence Controller management for each status.
 
 Flow example: controller saw non-response node and created new crd to fence the new, this initialized to “step: isolation” and current timestep. The controller create jobs related to the step and move status to running.
 - If node becomes “ready” in cluster, controller will change the crd to step:recovery and start triggering recovery jobs.
 
 After 5min (configurable) if node is still “not ready” controller will change to step:power_managment and status:new to start triggering pm jobs.
 
-#### Pods treatment
+### Pods treatment
 Pod treatment is done by “cluster fence agents” which will be run as part of a node fence treatment.
 
 Kubernetes follows taint-based-evictions. Taints and tolerations are ways to steer pods from nodes or evict pods that should stop.
@@ -187,212 +391,82 @@ Fence pods treatment rules:
 - If storage fence was performed, all pods that used this storage can be deleted from the api server.
 - If power management for reboot the node ran - all node resources can be removed from cluster.
 
-In contrast to the autoscaler, the fence controller cannot control the re-scheduling load once a node is fenced (on scaledown their controller gracefully treat the pods liveness). All resources are released at once, which can lead to overload and scale issues, which happens in parallel to the fence operation.
+In contrast to the autoscaler, the fence controller cannot control the re-scheduling load once a node is fenced (on scale down their controller gracefully treat the pods liveness). All resources are released at once, which can lead to overload and scale issues, which happens in parallel to the fence operation.
 
-Default node controller eviction policy doesn’t interfere with this logic. Evictions set the pod for terminating state until node is responsive to perform graceful shutdown. In pod treatment agents we will delete the pods’ objects only if the node does not get to ready and fenced. This action can trigger autoscaler to scaleup the cluster when big overload is removed from specific node and immediately reschedualed. 
+Default node controller eviction policy doesn’t interfere with this logic. Evictions set the pod for terminating state until node is responsive to perform graceful shutdown. In pod treatment agents we will delete the pods’ objects only if the node does not get to ready and fenced. This action can trigger autoscaler to scale up the cluster when big overload is removed from specific node and immediately rescheduled.
 
-In power management fencing we usually expect the machine to come up again and re-join to the cluster. Therefore, we do not clean the node object, but leave it in “not ready” state bounded until connectivity is returned. 
+In power management fencing we usually expect the machine to come up again and re-join to the cluster. Therefore, we do not clean the node object, but leave it in “not ready” state bounded until connectivity is returned.
 
-Note: A fencing method can be also to remove the node from the cluster using the cloud provider api.
+Note: A fencing method can also remove the node from the cluster using the cloud provider API if configured.
 
-## Example configuration
-2 node cluster (host0 - 192.168.1.11, host1 - 192.168.1.12) with two distinct PDUs (192.168.1.3 - apc, 192.168.1.4 - eaton) using brocade FC switch (192.168.1.2) for storage isolation.
+## To consider
 
-Brocade template:
-```
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-template-fc-switch-brocade
-   namespace: default
-  data:
-   template.properties: |-
-          name=fc_switch_brocade
-          agent_name=fence_brocade
-          ipaddr=192.168.1.2
-          password=brocade_password
-          username=brocade_admin
-```
+### Node problem detector
 
-APC template:
-
-```
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-template-apc-pdu
-   namespace: default
-  data:
-   template.properties: |-
-          name=apc_pdu
-          agent_name=fence_apc_snmp
-          must_sucess=yes
-          ipaddr=192.168.1.3
-          password=apc_password
-          username=apc_admin
-
-```
-
-Eaton template:
-```
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-template-eaton-pdu
-   namespace: default
-  data:
-   template.properties: |-
-          name=eaton_pdu
-          agent_name=fence_eaton_snmp
-          must_sucess=yes
-          ipaddr=192.168.1.4
-          password=eaton_password
-          username=eaton_admin
-          snmp-priv-prot=AES
-          snmp-priv-passwd=eaton_snmp_passwd
-          snmp-sec-level=authPriv
-          inet4-only=true
-```
-
-Method for enable and disable of brocade for host0:
-
-```
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-eaton-off-host0
-   namespace: default
-  data:
-   method.properties: |-
-        template=fence-method-template-eaton-pdu
-        plug=1
-        action=off
-
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-eaton-on-host0
-   namespace: default
-  data:
-   method.properties: |-
-        template=fence-method-template-eaton-pdu
-        plug=1
-        action=on
-```
-
-Method for enable and disable of eaton for host1:
-
-```
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-eaton-off-host1
-   namespace: default
-  data:
-   method.properties: |-
-        template=fence-method-template-eaton-pdu
-        plug=2
-        action=off
-
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-method-eaton-on-host1
-   namespace: default
-  data:
-   method.properties: |-
-        template=fence-method-template-eaton-pdu
-        plug=2
-        action=on
-```
-
-Same can be defined APC and eaton for both nodes.
-
-Finally fence configs:
-
-```
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-config-lago-kube-host0
-   namespace: default
-  data:
-   config.properties: |-
-    node_name=lago-kube-host0
-    isolation=fc-off
-    power_management=eaton-off eaton-on
-    recovery=fc-on
-
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-config-host1
-  data:
-   config.properties: |-
-    node_name=host
-    isolation=fc-off
-    power_management=eaton-off eaton-on
-    recovery=fc-on
-```
-
-
-## Aditional implementations details
-### Cluster fence policies
-Fencing policy allows each cluster to behave differently in case of connectivity issues. One of the main motivation for that is to prevent “fencing storms” from happening, but there are others. The controller is responsible to force the fence policy
-
-Fencing storm is a situation in which fencing for a few nodes in the cluster is triggered at the same time, due to an environmental issue.
-
-Examples:
-1. Switch failure - a switch used to connect a few nodes to the environment is failing, and there is no redundancy in the network environment. In such a case, the nodes will be reported as unresponsive, while they are still alive and kicking, and perhaps providing service through other networks they are attached to. If we fence those nodes, a few services will be offline until restarted, while it might not have been necessary.
-2. Management system network failure - if the management system has connectivity issues, it might cause it to identify that nodes are unresponsive, while the issue is with the management system itself.
-
-Some ways to prevent fencing storms:
-- Skip fencing if select % of hosts in cluster is non-responsive (will help for issue #2 above)
-- Skip fencing if detected the host cannot connect to storage.
+Daemon which runs on each node, detects node problems and reports them to apiserver.
+The project lives under [https://github.com/kubernetes/node-problem-detector/](https://github.com/kubernetes/node-problem-detector/) repository.
+The node problem reports can be used to detect different misbehavior than just node going into "Unready" status.
 
 ### Kdump integration
-When kdump enabled is set in NodeFenceConfig the controller will check for kdump notifications once node becomes not ready. Once dumping is recognized, we can delete all pods.
-In parallel to wait for kernel dumping the controller will start to execute fence stage normally (admin should take care to configure PM method to run after enough timeout to let the dumping finish).
-Kernel dumping is done by booting up node to kdump kernel that starts dumping to hard-coded fqdn  reachable in cluster that save the dumping data.
+When kdump enabled is set in node fence configuration the controller can check
+for kdump notifications once node becomes not ready. Once dumping is recognized,
+we can delete all pods.
+In parallel to waiting for kernel dumping the controller will start executing
+fence stage normally (admin should take care of configuring PM method to run after
+enough timeout to let the dumping finish).
+Kernel dumping is done by booting up node to kdump kernel that starts dumping
+to hard-coded fqdn reachable in cluster that save the dumping data.
 
 ### Alternatives considered
 1. Create a new Cloud Provider allowing the autoscaler to function for
    bare metal deployments.
-   
+
    This was considered however the existing APIs are load balancer
    centric and hard to map to the concept of powering on and off nodes.
-   
+
    If the Cloud Provider API evolves in a compatible direction, it
    might be advisable to persue a Bare Metal provider and have it be
    responsible for much of the fencing configuration.
 
 1. A solution that focused exclusively on power fencing.
-   
+
    While this would dramatically simplify the configuration required,
    many admins see power fencing as a last resort and would prefer
    less destructive way to isolate a misbehaving node, such as network
    and/or disk fencing.
-   
+
    We also see a desire from admins to use tools such as `kdump` to
    obtain additional diagnostics, when possible, prior to powering off
    the node.
 
 1. Attaching fencing configuration to nodes.
-   
+
    While it is tempting to add details on how to fence a node to the
    kubernetes Node objects, this scales poorly from a maintenance
    perspective, preventing nodes from sharing common methods (such as
    `kdump`).
-   
+
    This is especially true for cloud deployments where all nodes are
    controlled with the same credentials. However, even on bare metal
    the only point of differention is often the the IP addresses of the
    IPMI device, or the port number for a network switch, and it would
    be advantageous to manage the rest in one place.
 
-### RBAC rules
-Not defined yet explicitly.
+### Roadmap
 
-### Open questions
-- Using https://github.com/kubernetes/node-problem-detector in extend to only check readness by the controller.
-- https://github.com/kubernetes/community/blob/master/contributors/design-proposals/cloud-provider/cloud-provider-refactoring.md
+Underway:
+
+* Implement the fence flow mechanism (state automaton)
+* Provide fence agent for the guaranteed list of fencing methods
+
+Would like to get soon:
+
+* Demonstrate the fencing mechanism on AWS and GCE (optionally OpenStack)
+* Generate metrics based on the fence flow
+* Per set-of-nodes fencing configuration
+* Cluster fence policies applied
+
+Other possibilities:
+
+* Consume events from the [Node problem detector](https://github.com/kubernetes/node-problem-detector)
+* Consume events/data from other source providing information about node behavior

@@ -1,0 +1,14 @@
+---
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+   name: fence-method-template-apc-pdu
+   namespace: default
+  data:
+   template.properties: |-
+          name=apc_pdu
+          agent_name=fence_apc_snmp
+          must_sucess=yes
+          ipaddr=192.168.1.3
+          password=apc_password
+          username=apc_admin
