@@ -3,7 +3,7 @@ Status: Pending
 
 Version: Alpha
 
-Implementation Owner: Yaniv Bronhaim (ybronhei@redhat.com)
+Implementation Owners: Yaniv Bronhaim (ybronhei@redhat.com)
 
 Current Repository: https://github.com/rootfs/node-fencing
 
@@ -91,35 +91,32 @@ In the absence of this feature, an end-user has no ability to safely or reliably
 1. In a bare metal Kubernetes deployment, StatefulSets should not require admin intervention in order to restore capacity when a member Pod was active on a lost worker
 1. In a bare metal Kubernetes deployment, StatefulSets should not require admin intervention in order to scale up or down when a member Pod was active on a lost worker
 1. In a Cloud Kubernetes deployment, StatefulSets without an autoscaler should not require admin intervention in order to scale up or down when a member Pod was active on a lost worker
+1. Pods on a node providing HA services can suffer from a network malfunction caused be an incorrectly functioning
+network utilities on a node. Rebooting a node allows to re-schedule the pods safely.
 
 In other words, the failure of a worker node should not represent a single point of failure for StatefulSets.
 
-TODO: Pods on a node providing a service can suffer from a network malfunction caused be an incorrectly functioning
-network utilities on a node. Rebooting a node can fix the issue.
-
 ## Admin experience
+we can see a set of nodes as a set of containers. Each time an application crushes or a running process makes underlying container un-operable, the container is restarted or recreated. We want the same to be done for the nodes. Each time there is an issue causing a node to misbehave, we need to perform suitable actions so the node is forced back to conforming behavior automatically without a SRE intervention.
+
+Operational view around node management will be logged to cluster events and presented in management console (e.g cockpit). The status of fence operations will be followed and managed by the admin. Admin will be able to force stop of fencing operation and fix manually problems.
+In addition, problem events counter will be integrated. This allows to monitor issues and their handling in operated cluster. Alarms can be set when issues repeated in certain period that the admin configures (e.g. if one pod causes hardware crashes, this monitoring view will provide overview of the cause that can be fixed manually).
 
 ### Configurations required
 * How to trigger fence devices/apis - general template parameters (e.g. cluster UPS address and credentials) and overrides values per node for specific fields (e.g. ports related to node)
 * How to run a fence flow for each node (each node can be attached to several fence devices\apis and the fence flow can defer)
 
-TODO: we can see a set of nodes as a set of containers. Each time an application crushes or a running process makes underlying container
-un-operable, the container is restarted or recreated. We want the same to be done for the nodes. Each time there is an issue causing
-a node to misbehave, we need to perform suitable actions so the node is forced back to conforming behavior automatically without a SRE intervention.
-
 ## Node auto-repair mechanism
 
 Cloud providers such as AWS or GCE expose a cloud API through which a fencing action can be performed.
-Usually, only AWS credentials and an instance name are required to access the AWS API. The same holds for GCE.
-On the other hand, bare-metal provider requires knowledge of hardware specific parameters.
-Such as Eaton PDU parameters to perform power management actions or switch brocade parameters
-to disconnect a node from the network.
+In most cases only credentials to the cluster and an instance name are required to access the cloud provider API.
+Over bare-metal cluster, an API provider requires knowledge of hardware specific parameters (e.g Eaton PDU parameters to perform power management actions or switch brocade parameters to disconnect a node from the network).
 
 From the point of view of the fence controller, the node name is the only parameter
 required to perform a fencing action. Thus, it is important to abstract from a specific
 cloud provider requirements and build a layer through which the fencing actions are perform.
-E.g. for AWS one can run a thread that communicates with the AWS cloud API,
-for bare metal deploy a pod with hardware specific configuration.
+We can split the handling - Over cloud-provider API the controller runs a thread that communicates with the cloud API,
+and for bare metal the controller deploys a job with hardware specific configuration that execute fence agent for performing the fence action.
 
 In general, each node auto-repair operation can be modeled as a sequence of transitions
 between states (e.g. ``bad node detected``, ``node queued``, ``node isolated``), each transition
@@ -177,8 +174,7 @@ deleted (e.g. due to disruption budget limitations). Thus, some fence policies m
 ## Implementation
 
 ### Fence Controller
-The fence controller is a stateless controller (state automaton) that can be deployed
-as a pod in a cluster or a process running outside the cluster.
+The fence controller is stateless and manipulate state automaton flow. 
 The controller identifies unresponsive node by getting events from the apiserver.
 Once the node misbehaves (e.g. becomes “not ready”) the controller initiates a fence flow.
 
@@ -223,20 +219,19 @@ node is moved to the ``new`` state. The number of restarts is configurable as we
 | ![Fencing controller automaton](node-fence-automaton.png "Fence controller state transitions") |
 
 TODO: add arrows (if node ready -> move to done)
-TODO: The fence controller(s) should run on the master nodes (as it is more secure).
+TODO: Q- The fence controller(s) should run on the master nodes (as it is more secure).
 
 ### Provider specific fence agents
 
 The fence agents is a component that implements the actual fencing action.
-In case of AWS environment, the implementations reduces to sending a request
-to AWS cloud provider API and waiting for a response.
-In case of bare-metal it may correspond to running a Pod pulling an image
-providing all functionality needed to reboot or to isolate a node. Then waiting
-for the pod to finish.
+In case of AWS\GCE environment, the implementations reduces to sending a request
+to the specific cloud provider API and waiting for a response.
+In case of bare-metal it corresponds to running a Pod pulling an image
+providing all functionality needed to reboot or to isolate a node. Then monitoring the pod to finish.
 In both cases if the fencing action fails, the controller may retry the action
 before it changes its state to failed.
 
-Node: fencing action is a general expression that does not refer to a specific
+NOTE: fencing action is a general expression that does not refer to a specific
 implementation (e.g. a sequence of fencing methods)
 
 In any case, complexity of running a single fencing action should be hidden
@@ -456,11 +451,13 @@ to hard-coded fqdn reachable in cluster that save the dumping data.
 
 Underway:
 
-* Implement the fence flow mechanism (state automaton)
-* Provide fence agent for the guaranteed list of fencing methods
+* Implement the fence flow mechanism (state automaton) over GCE - using types configs
+* Implement the fence flow mechanism using fence agents for bare-metal support (focus on 1 or 2 PM devices)
+This will allow to demo full roll-out on cloud environments and bare-metal.
 
 Would like to get soon:
 
+* CI tests
 * Demonstrate the fencing mechanism on AWS and GCE (optionally OpenStack)
 * Generate metrics based on the fence flow
 * Per set-of-nodes fencing configuration
