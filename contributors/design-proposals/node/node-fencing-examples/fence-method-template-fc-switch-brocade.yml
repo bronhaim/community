@@ -1,0 +1,13 @@
+---
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+   name: fence-method-template-fc-switch-brocade
+   namespace: default
+  data:
+   template.properties: |-
+          name=fc_switch_brocade
+          agent_name=fence_brocade
+          ipaddr=192.168.1.2
+          password=brocade_password
+          username=brocade_admin
