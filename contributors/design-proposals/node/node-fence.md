@@ -1,157 +1,197 @@
-# Node fencing
+# Node remedy
 Status: Pending
 
 Version: Alpha
 
-Implementation Owners: Yaniv Bronhaim (ybronhei@redhat.com)
+Implementation Owners: Yaniv Bronhaim (ybronhei@redhat.com), Jan Chaloupka (jchaloup@redhat.com)
 
 Current Repository: https://github.com/rootfs/node-fencing
 
-## Overview
-Rationale and architecture for the addition of a fencing mechanism in Kubernetes clusters. In [pod-safety](https://github.com/kubernetes/community/blob/16f88595883a7461010b6708fb0e0bf1b046cf33/contributors/design-proposals/pod-safety.md) proposal we describe the need and desire solutions for unrecoverable cluster partition. In the following we define motivations and flows to provide fence actions using fence controller to free the partitioned entities and recover the workload by isolation and power management operations.
+## Motivation
+When a cluster size reaches a certain order of magnitude, the maintenance of each
+node becomes a considerable issue. It is no longer feasible to pet each node and
+investigate every situation in which the node starts to misbehave. The time spent
+on the problem solving becomes a precious resource which if consumed improperly
+can increase overall maintenance cost. Thus, it is desirable for the cluster
+to have ability to heal itself.
 
-### Motivation
-Kubernetes cluster can get into a network partition state between nodes to the apiserver
-running on the master node (e.g. network device failure).
-When that happens their nodes’ status is changed to “not ready” by the node controller
-and the scheduler cannot know the status of pods running on that node without reaching
-the nodes’ kubelet service. From such scenario, k8s (since 1.8) defines an eviction timeout
-(forced by the node controller) such that after 5 minutes pods will enter a termination
-state in the apiserver and will try to shutdown gracefully when possible (this happens
-only if the connectivity returns).
+Based on the same self-healing principle of applications running in a container,
+the cluster should be able to detect which nodes are misbehaving and carry proper
+actions that will either cure each affected node or replace it with a new instance.
 
-If the pod belongs to a ReplicaSet, once the termination state is set, the ReplicaSet
-controller will immediately start another instance of that pod.
-However when the pod is part of a StatefulSet, the StatefulSet controller won’t start
+The goal of the proposal is to design and provide a solution implementing self-healing mechanism that is general enough to react on various aspects of a node behavior
+and at the same time simple enough to allow to run various remedy operations (either
+generic or specific for a cloud provider environment).
+
+### Known limitations
+
+When a node stop responding (for more than a certain period of time),
+the Kubernetes initializes an eviction process that will
+cause pods assumed to be running on the node to enter a termination state.
+However, the Apiserver and the node controller have no way of knowing if pods
+on the node are still running and serving or if they are down by that time.
+If the issue is caused by a network partition state between nodes and the apiserver
+running on the master node (e.g. network device failure), the remedy could be to
+switch to a different network without performing the eviction.
+
+A node can show signs of misbehavior even if it is reporting a Ready status:
+* A pod may need to access an AWS volume which claims it is not attached on a node
+even if it actually is. The remedy here can be to restart the node so the volume
+is properly detached and re-attached again (not necessarily on the same node).
+* Node resources consumed by a node daemon or a container runtime environment may
+grow over time without any visible reason (e.g. faulty garbage collector in Go
+runtime environments or a container runtime environment loosing memory/not releasing
+i-nodes) which can eventually exhaust available resource causing a node
+to be inoperable. Rebooting the node can help to re-claim the resources.
+
+When k8s is deployed on a cloud providers such as AWS or GCE, the autoscaler uses
+the Cloud Provider APIs to recognize unhealthy nodes and effectively bounding
+the amount of time the node will stay in the “not ready” state until the node-controller
+removes the node (if possible, kernel panic can't be handled that way), and how long
+the scheduler will need to wait before it can safely start the pod elsewhere.
+This treatment is not immediate and not covered in bare metal deployments.
+Also, there is no mechanism to recover quicker, but only to downscale the partitioned
+nodes. This leads to admin intervention which we can avoid using automated mechanism.
+This is particularly problematic because all StatefulSet scaling events (up and down)
+block until existing failures have been recovered. From some perspectives,
+it could be considered that each node hosting a StatefulSet member has become
+a single point of failure for that set.
+
+### Restrictions
+Each higher-level construct built on top of pods has a different
+requirements and expectations of guarantees around its life-cycle:
+* If the pod belongs to a ReplicaSet, once the termination state is set, the ReplicaSet
+controller will immediately start another instance of that pod (without any side-effects
+as the ReplicaSet is assumed to be stateless).
+* When the pod is part of a StatefulSet, the StatefulSet controller won’t start
 new instance of that pod until the kubelet responds with the pod’s status.
 This is because there is a permanent association between a StatefulSet member and
 its storage. Not waiting would potentially result in multiple copies of a member,
-all writing to the same volume (leading to corruption or worse).
+all writing to the same volume leading to corruption or worse (see [pod-safety](https://github.com/kubernetes/community/blob/16f88595883a7461010b6708fb0e0bf1b046cf33/contributors/design-proposals/pod-safety.md)).
+* Pet pod could also represent a VM that needs to be removed (with all its resources freed)
+before a new instance is created.
 
-TODO: a pod needs an AWS volumes which claims it mounted on a node but it is actually not.
-So we need to restart the node so the volume is properly detached from the node
-and can be properly attached on a different node.
-
-TODO: node resource consumed by a node daemon or a container runtime environment may
-grow over time without any visible reason (e.g. faulty garbage collector in Go runtime environments
-or a container runtime environment loosing a memory/not releasing i-nodes) which can
-eventually exhaust some of the available resource causing a node to be inoperable.
-Restarting a node can help to re-claim the resources.
-
-
-### Cloud deployments
-When k8s is deployed on a cloud such as AWS or GCE, the autoscaler uses the Cloud Provider APIs to recognize unhealth nodes and effectively bounding the amount of time the node will stay in the “not ready” state until the node-controller removes the node (if possible, kernel panic can't be handled that way), and how long the scheduler will need to wait before it can safely start the pod elsewhere.
-This treatment is not immediate and not covered in bare metal deployments. Also, there is no mechanism to recover quicker, but only to downscale the partitioned nodes. This leads to admin intervention which we can avoid using automate fence controller.
-This is particularly problematic because all StatefulSet scaling events (up and down) block until existing failures have been recovered.  From some perspectives, it could be considered that each node hosting a StatefulSet member has become a single point of failure for that set.
-
-### Scope of this proposal
-We cover isolation (storage-fence, cluster isolation) and power-management (rebooting the node’s machine) actions while node is partitioned from cluster until it becomes responsive again.
-We don’t cover:
-* HA applications
-* Collaborative storage based fencing (e.g. sanlock)
-* Network fencing
-
-We assume:
-* Containers that lose access to network and/or storage will self terminate (important for environments relying on network and/or storage fencing)
-* With isolating the node we benefit by allowing quicker and intensive actions when node that runs stateful applications becomes unreachable.
-
-NOTE: We need to reflect that in the Roadmap, something like first we concentrate purely on the power management operations but we plan to extend the supported fencing/isolation to other areas like the storage fencing.
-
-### Solution proposal
-To address this we propose the addition of the fence controller which, in the event
-of a node-level failure, signals to a new fencing executor to isolate the affected node
-and notifies the apiserver that it is safe to continue recovery.
-
-This functionality, if configured by the admin, is absolutely necessary for nodes running
-StatefulSets as they are currently the only construct that provides at-most-one
-semantics for its members.  In the absence of this feature, an end-user has no ability
-to safely and/or reliably allow StatefulSets to be recovered and as such end-users
-will not be provided with a mechanism to enable/disable this functionality on a set-by-set basis.
-
-Depending on the deployment, the fencing executors will have capabilities such as:
-* Power management fencing: powering off\on\rebooting a node
-* Storage fencing: disconnection from specific storage to prevent multiple writers, and unfence when connectivity is restored
-* Cluster fence: Cordon node, removing node workload from apiserver
-
-Once the node has been made safe/isolated by using one or more of the fencing mechanisms listed above,
-we can know that either the pods are not running anymore or they are not accessing shared
-resources (storage or network) and we can safely delete their objects from the apiserver
-to allow the scheduler to initiate new instance.
-
-The design and implementation acknowledge that other entities, such as the autoscaler,
-are likely to be present and performing similar monitoring and recovery actions.
-Therefore it is critical that the fencing controller does not create or be is not susceptible to race conditions.
+The self-healing mechanism must take all the guarantees into account so the remedy operation
+is performed properly.
 
 ## User experience
-The loss of a worker node should be transparent to user's of StatefulSets. Recovery time for affected Pods should be bounded and short, allowing scale up/down events to proceed as normal afterwards.
 
-In the absence of this feature, an end-user has no ability to safely or reliably allow StatefulSets to be recovered and as such end-users will not be provided with a mechanism to enable/disable this functionality on a set-by-set basis.
+If possible, any node problem occurring in a cluster should be transparent to user applications.
 
-### Use Cases
-1. In a bare metal Kubernetes deployment, StatefulSets should not require admin intervention in order to restore capacity when a member Pod was active on a lost worker
-1. In a bare metal Kubernetes deployment, StatefulSets should not require admin intervention in order to scale up or down when a member Pod was active on a lost worker
-1. In a Cloud Kubernetes deployment, StatefulSets without an autoscaler should not require admin intervention in order to scale up or down when a member Pod was active on a lost worker
-1. Pods on a node providing HA services can suffer from a network malfunction caused be an incorrectly functioning
-network utilities on a node. Rebooting a node allows to re-schedule the pods safely.
-
-In other words, the failure of a worker node should not represent a single point of failure for StatefulSets.
+1. As a user running a database as a StatefulSets, I would like to be able to scale
+   up/down normally no matter if a node running my workload is malfunctioning
+1. As a user running a production backend, I would like to have the cluster to repair
+   a node in case it starts to show signs of services degradation without any manual intervention
+1. Pods on a node providing HA services can suffer from a network malfunction caused be
+   an incorrectly functioning network utilities on a node. Rebooting a node allows to re-schedule the pods safely.
+1. In a bare metal Kubernetes deployment, StatefulSets should not require admin intervention
+   in order to restore capacity when a member Pod was active on a lost worker
 
 ## Admin experience
-we can see a set of nodes as a set of containers. Each time an application crushes or a running process makes underlying container un-operable, the container is restarted or recreated. We want the same to be done for the nodes. Each time there is an issue causing a node to misbehave, we need to perform suitable actions so the node is forced back to conforming behavior automatically without a SRE intervention.
 
-Operational view around node management will be logged to cluster events and presented in management console (e.g cockpit). The status of fence operations will be followed and managed by the admin. Admin will be able to force stop of fencing operation and fix manually problems.
-In addition, problem events counter will be integrated. This allows to monitor issues and their handling in operated cluster. Alarms can be set when issues repeated in certain period that the admin configures (e.g. if one pod causes hardware crashes, this monitoring view will provide overview of the cause that can be fixed manually).
+1. As an SRE I would like to set automatic self-healing mechanism so I minimize
+   the number of manual interventions.
+1. As an admin/cloud operator I would like to see the current state of the remedy
+   operations in a compound manner so I can monitor ability of the cloud to self-heal
+   and react properly on distinctive situation (e.g. be able to force stop of fencing operation and fix problems manually).
+1. As an admin/cloud provider I would like to be able to set various remedy operations
+   and conditions under which the operations get performed (i.e. easy-to-configuration).
+1. As an architect of a new source of node behavior notifications I would like to be able
+   to extend the list of resource the controller consumes to make a better remedy decision.
 
-### Configurations required
-* How to trigger fence devices/apis - general template parameters (e.g. cluster UPS address and credentials) and overrides values per node for specific fields (e.g. ports related to node)
-* How to run a fence flow for each node (each node can be attached to several fence devices\apis and the fence flow can defer)
 
-## Node auto-repair mechanism
+In addition, problem events counter will be integrated. This allows to monitor issues
+and their handling in operated cluster. Alarms can be set when issues repeated in certain period
+that the admin configures (e.g. if one pod causes hardware crashes, this monitoring
+view will provide overview of the cause that can be fixed manually).
 
-Cloud providers such as AWS or GCE expose a cloud API through which a fencing action can be performed.
-In most cases only credentials to the cluster and an instance name are required to access the cloud provider API.
-Over bare-metal cluster, an API provider requires knowledge of hardware specific parameters (e.g Eaton PDU parameters to perform power management actions or switch brocade parameters to disconnect a node from the network).
+## Solution proposal
 
-From the point of view of the fence controller, the node name is the only parameter
-required to perform a fencing action. Thus, it is important to abstract from a specific
-cloud provider requirements and build a layer through which the fencing actions are perform.
-We can split the handling - Over cloud-provider API the controller runs a thread that communicates with the cloud API,
-and for bare metal the controller deploys a job with hardware specific configuration that execute fence agent for performing the fence action.
+Depending on cloud provider environment, each remedy operation can have different
+implementation requirements:
+* Cloud providers such as AWS or GCE expose a cloud API that allows to perform various machine related actions.
+In most cases only credentials and an instance name are required to access the cloud provider API.
+* Bare-metal cloud providers may require knowledge of hardware specific parameters such as
+Eaton PDU parameters to perform power management actions or switch brocade parameters
+to disconnect a node from the network.
+* There may be new emerging providers that are not yet known, required parameters to be set are not yet identified
+* Any combination of cloud providers as hybrid cloud providers where each subset of nodes run on a different provider
 
-In general, each node auto-repair operation can be modeled as a sequence of transitions
-between states (e.g. ``bad node detected``, ``node queued``, ``node isolated``), each transition
-possibly triggering a fence action. E.g. transition from ``node queued`` to ``node isolated``
-can trigger network isolation.
+All those information increase the complexity of the self-healing mechanism.
+In order to keep the complexity sane, the remedy mechanism is broken down into two pieces:
+* Controller that is responsible for monitoring nodes (and/or other sources providing information about each node behavior) and initiating actions responsible for changing node states
+* Implementation of individual actions as pod specifications (i.e. remedy pod) that are responsible for converging a node into its expected state
 
-**Example**: when a node problem detector reports crashes of applications due to unaccessible AWS volume the fence controller may:
+All the cloud provider specific knowledge and implementation are delegated into pods.
+This way, each operator that has a specific knowledge and expertise of affected environment can provide his/her own solutions.
+Given a specific remedy solution is shipped in a container image, it is also easier to update and test individual pieces
+without a need to update the controller itself.
+Also, the open-source communities provide a lot of functioning solutions that can be used.
 
+At the same time the approach makes the controller transparent to a way a given remedy operation is performed.
+Thus, the controller implementation can concentrate purely on problems that are related to:
+- Monitoring and detection of events that a misbehaving node generates (either as a node status reporting `Unready` or a problem node detector reporting application crashes)
+- Generating metrics about the self-healing process itself (e.g. how many times a node was repaired, how many times a node was terminated due to network failures)
+- Decision making logic that controls when and which remedy action gets triggered
+
+and can ignore:
+- Credentials management needed to perform cloud specific operations (delegating the responsibility to an operator for figuring out the way to provide credentials)
+- SSH keys management (the keys can be read from a specific URL that is available only on a specific subnet)
+- Distribution of specific configuration tailored for each node (bare-metal providers require more parameters to perform power-management operations)
+
+Some remedy operations require to be modeled as a state automaton.
+Given the controller is designed to react on node misbehavior by creating a pod,
+it does not keep state of any of the remedy operations internally.
+This decision simplifies the overall design of the controller.
+On the other hand, it shifts responsibility of making sure an operation is performed
+properly to remedy pod implementation. Including retry mechanisms in case the pod fails,
+is recreated and needs to start from a non-initial state.
+
+If a remedy pod fails and a node does not converges to its expected state, the pod is recreated again.
+The controller checks if there is any remedy pod running before recreated it so only one instance of a remedy pod per each node is running.
+
+Reaction of the controller (which operation gets triggered) on a node misbehavior are stored in a `ConfigMap` (most likely as a blob that gets interpreted within the controller).
+The configuration can be similar to the following one (just for illustrative means, the final form may be different):
+
+```yaml
+apiVersion: node-repair/v1alpha
+kind: Configuration
+# optional node selector (type=compute, type=accelerated, type=storage-optimized)
+nodeSelector: type=compute
+# list of thresholds tracked, and the remedy to execute if triggered
+# note: you could track many node conditions other than ready
+thresholdConfigs:
+- nodeConditionType: Ready
+  nodeConditionStatus: false
+  nodeConditionPeriod: 10m
+  remedy: repair
+# users may create remedies for any number of things that could happen to a node
+# the tool only cares if the configured job runs to success or failure
+remedyConfigs:
+# the repair remedy that in this case says run a job that executes a command to clean node
+# the pod template should assume standard input via downward api that describes what node is being remedied
+- name: repair
+  podTemplate:
+   spec:
+    containers:
+    - name: repair
+      image: IMAGE:VERSION
+      command: [ "binary", "clean node command" ]
+    restartPolicy: Never
+# the terminate remedy that in this case says run a job that executes a command to terminate node
+- name: terminate
+  podTemplate:
+   spec:
+    containers:
+    - name: terminate
+      image: IMAGE:VERSION
+      command: [ "binary", "terminate node command" ]
+    restartPolicy: Never
 ```
-1. Mark node unschedulable
-2. Remove resources of all pods that suffer from the crashes and/or has the AWS volume mounted
-3. Detach the AWS volume (in case it is attached)
-4. Restart a node
-5. Mark the node schedulable again
-```
 
-In case a node auto-repair operation is interrupted (either due to controller crash or a node failure),
-we need a reliable way to store the last state of the operation so the fence flow can be resumed
-once a new fence controller is up and running.
-Given a controller should/must be stateless, we need to store the states
-outside of the controller. Either as a node annotation or via new crd (custom resource definition).
-
-### Cluster fence policies
-Fencing policy allows each cluster to behave differently in case of connectivity issues.
-One of the main motivation for that is to prevent “fencing storms” from happening,
-but there are others. The controller is responsible for forcing the fence policy.
-
-Fencing storm is a situation in which fencing for a few nodes in the cluster
-is triggered at the same time, due to an environmental issue.
-
-Some ways to prevent fencing storms:
-* Skip fencing if select % of hosts in cluster is non-responsive (will help for issue #2 above)
-* Skip fencing if detected the host cannot connect to storage.
-
-**Examples**:
+When deciding which remedy operation to perform, the controller should try to collect
+more information before actually triggering the operation (e.g. based on remedy policies).
+For example:
 
 1. Switch failure - a switch used to connect a few nodes to the environment is failing,
 and there is no redundancy in the network environment. In such a case,
@@ -160,30 +200,96 @@ and perhaps providing service through other networks they are attached to.
 If we fence those nodes, a few services will be offline until restarted,
 while it might not have been necessary.
 
-2. Management system network failure - if the management system has connectivity issues,
+1. Management system network failure - if the management system has connectivity issues,
 it might cause it to identify that nodes are unresponsive,
 while the issue is with the management system itself.
 
-3. In some cases the AWS volume can not be dettached or only some of the affected pods can be
-deleted (e.g. due to disruption budget limitations). Thus, some fence policies may be applied:
-* Limit the number of resources (e.g. pods) deleted per unit of time
-* Respect disruption budget (e.g. remove the pods from a node via the proper endpoint) (NOTE: this may be already implemented in the Delete request)
-* Process only one node at a given time to minimize disruption of the cluster (e.g. in case other nodes are still providing services)
+The design and implementation also need to acknowledge that other entities,
+such as the autoscaler, are likely to be present and performing similar monitoring and recovery actions.
+Therefore it is critical that the remedy controller does not interfere or is to be susceptible to race conditions.
+
+Other sources informing about a node behavior can be utilized:
+* **Node problem detector**: Daemon which runs on each node, detects node problems and reports them to apiserver.
+The project lives under [https://github.com/kubernetes/node-problem-detector/](https://github.com/kubernetes/node-problem-detector/) repository.
+The node problem reports can be used to detect different misbehavior than just node going into "Unready" status.
+* **Kdump integration**: When kdump enabled is the controller can check for kdump notifications once node
+becomes not ready. Once dumping is recognized, the controller can use the notification
+to make a better conclusion on which remedy operation needs to be run.
 
 
-## Implementation
+### Remedy policies
+The policies allows to regulate remedy operations performed throughout the cluster such as:
 
-### Fence Controller
-The fence controller is stateless and manipulate state automaton flow. 
-The controller identifies unresponsive node by getting events from the apiserver.
-Once the node misbehaves (e.g. becomes “not ready”) the controller initiates a fence flow.
+* How many times a remedy operation gets performed over a single node per a time period (e.g. backoff policy)
+* Upper bound on a number of nodes that can be remedied simultaneously (e.g. a node isolation performed over a set of nodes can lead to a "fencing storms")
+* Maximum number of retries a remedy pod gets recreated before the controller gives up (can be set to "never give up")
+* Limit the amount of resources (e.g. nodes) removed per a time period
+* Limit the set of nodes to be self-healed (e.g. master nodes should not be restarted without an admin intervention)
+* Set a waiting period before a node is processed (in case a node manages to fix itself on its own)
 
-The controller is defined as a n-tuple (S, T, r, new, F), where `S` denotes a set of states,
+In some cases it is required to perform only a single node remedy at a given time
+to prevent a cluster from draining and recreating a lot of pods at the same time.
+
+NOTE: Fencing storm is a situation in which fencing for a few nodes in the cluster
+is triggered at the same time, due to an environmental issue.
+Some ways to prevent fencing storms:
+* Skip fencing if select % of hosts in cluster is non-responsive (will help for issue #2 above)
+* Skip fencing if detected the host cannot connect to storage.
+
+## Remedy pods
+
+A remedy pod is the smallest operational unit of work that gets created as a reaction
+to a node misbehavior. Its purpose is to provide a solution that encompasses all the logic
+needed to remedy a node.
+
+Depending on the characteristics of each misbehavior, the remedy pod can perform combination of:
+* Power management fencing: powering off\on, rebooting a node
+* Storage fencing: disconnection from specific storage to prevent multiple writers, and unfence when connectivity is restored
+* Cluster fencing: Cordon node, removing node workload
+* Network isolation
+* Other environment specific actions (e.g. running diagnostics of a node)
+
+The remedy operations can be broken into two categories:
+- Stateless operations: the operation is restarted from the beginning no matter where the previous run failed
+- Stateful operations: the operation needs to resume in the last state in which the previous operation failed
+
+Currently, there is no plan to make the controller aware of the stateful operations.
+Though, some logic may be added later to support the case.
+
+### Cloud provider remedy pods
+
+Currently, the following cloud providers are identified:
+* AWS
+* GCE
+* OpenStack
+* Azure
+* WmWare
+
+NOTE: the list is not meant to be a complete enumeration of all available providers
+
+Each remedy pod needs to know how to access a specific cloud provider API and
+what parameters are needed to perform selected action.
+There are multiple ways how to provide such parameters to each remedy pod:
+
+* Per node configuration (e.g. read from a ConfigMap)
+* Per set of nodes configuration (e.g. read from a ConfigMap)
+* Explicit assumed configuration common for all nodes
+* Centralized place that can by queried from within a running pod (e.g. URL metadata link, cloud database)
+
+In any case we need to minimize the remedy pod configuration complexity.
+E.g. the node configuration fallback mechanism can be used (e.g. the per set of nodes configuration overrides the default one).
+
+#### Bare-metal cloud providers
+
+As the bare-metal provider requires deeper knowledge of the environment,
+some operations require to be implemented as a sequence of steps.
+Each step corresponding to a state that needs to be kept in the process in case a failure
+occurs and the process needs to be resumed from the last state.
+
+**Example**: Some bare-metal operations can be modeled as a state automaton.
+The automaton can be defined as an n-tuple (S, T, r, new, F), where `S` denotes a set of states,
 `T` a set of fence steps, `r` stands for a transition function, ``new`` is its initial state
-and ``F`` a set of final states.
-
-The set `S` consists of:
-
+and ``F`` a set of final states. The set `S` consists of:
 * ``new``: a node gets into the state in a moment it starts misbehaving (e.g. node reporting `Unready` status)
 * ``running``: a node is isolated and ready for power management actions
 * ``done``: a node is ready for recovery
@@ -191,7 +297,6 @@ The set `S` consists of:
 * ``error``: either of the fence steps failed
 
 The transition function ``r`` is defined as:
-
 * When a node is in the ``new`` state for a specified number of times units,
 the ``isolation`` step is triggered. Once the step is completed,
 the node transitions to the ``running`` state. In case the step is not completed,
@@ -208,262 +313,29 @@ the node transitions to the ``done`` state.
 If the ``recovery`` step is completed, move the the ``final`` state. Otherwise,
 transition to the ``error`` state.
 
-If a fence step fails, it can be retried a configurable number of times before
+If any of the steps fail, it can be retried a configurable number of times before
 the node transitions into the ``error`` state.
-
-If a node gets into the ``error`` state, entire fencing flow is restarted and the
+If a node gets into the ``error`` state, entire execution is restarted and the
 node is moved to the ``new`` state. The number of restarts is configurable as well.
 
-| Fence controller state transitions |
-|:--:|
-| ![Fencing controller automaton](node-fence-automaton.png "Fence controller state transitions") |
-
-TODO: add arrows (if node ready -> move to done)
-TODO: Q- The fence controller(s) should run on the master nodes (as it is more secure).
-
-### Provider specific fence agents
-
-The fence agents is a component that implements the actual fencing action.
-In case of AWS\GCE environment, the implementations reduces to sending a request
-to the specific cloud provider API and waiting for a response.
-In case of bare-metal it corresponds to running a Pod pulling an image
-providing all functionality needed to reboot or to isolate a node. Then monitoring the pod to finish.
-In both cases if the fencing action fails, the controller may retry the action
-before it changes its state to failed.
-
-NOTE: fencing action is a general expression that does not refer to a specific
-implementation (e.g. a sequence of fencing methods)
-
-In any case, complexity of running a single fencing action should be hidden
-in specific implementation so the fence controller is independent of a provider
-and it is easy to extend the list of supported cloud providers with new ones.
-
-Currently, the following cloud providers are identified:
-* AWS
-* GCE
-* OpenStack
-* Azure
-* WmWare
-
-NOTE: the list is not to be a complete enumeration of all available providers
-
-Each fence agent needs to know how to access a specific cloud provider API and
-what parameters are needed to perform selected action.
-There are multiple ways how to provide such parameters to each agent.
-Either to specify per node configuration that each agent can read or
-to read all the parameters from a centralized location and inject them into
-fence agent. In either case we need to minimize the agent configuration
-complexity.
-
-By default, there is no explicit configuration needed.
-It is assumed only cloud provider credentials and a node instance name
-are required. In case more parameters are needed to perform a fencing action,
-they can be set in the fence controller configuration (in case they are common
-for all nodes) or via ``ConfigMap`` for a specific node (or a set of nodes).
-
-In our proposal each fencing action is implemented as a sequence of fencing
-methods (e.g. restart AWS instnace, turn PDU on/off, network switch on/off).
-
-In the default case (e.g. for AWS), the configuration could look like:
-
-```yaml
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-config-[NODE_NAME]
-  data:
-   config.properties: |-
-    node_name=[NODE_NAME]
-    isolation=mark-unschedulable
-    power_management=restart-instance
-    recovery=mark-unschedulable
-```
-
-Given this configuration is default, it does not have to be specified at all.
-Though it can be overrided by a specific one.
-
-For the bare-metal provider the node fence configuration could be specified as:
-
-```yaml
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-config-[NODE_NAME]
-  data:
-   config.properties: |-
-    node_name=[NODE_NAME]
-    isolation=fc-off
-    power_management=eaton-off eaton-on
-    recovery=fc-on
-   fence-method-fc-on: |-
-    template=fence-method-template-fc-switch-brocade
-    plug=2
-    action=on
-   fence-method-fc-off: |-
-    template=fence-method-template-fc-switch-brocade
-    plug=2
-    action=off
-   fence-method-eaton-on: |-
-    template=fence-method-template-eaton-pdu
-    plug=1
-    action=on
-   fence-method-eaton-off: |-
-    template=fence-method-template-eaton-pdu
-    plug=1
-    action=off
-```
-
-The fence node configuration file centralizes the information about “how” the node can be “fenced” from the cluster.
-In general, it consists of 3 fencing steps: “isolation”, “power-management” and “recovery”.
-Each step specifying a sequence of methods.
-Each fence method is an instance of a fencing template that allows to reuse parameters for common devices.
-Check [examples](node-fencing-examples) to see some of the templates.
-
-#### Fallback mechanism
-
-More specific node fence configuration is always preferred to a more general one:
-
-* Default node fence configuration (no ``ConfigMap`` name)
-* Per set-of-nodes fence configuration (``fence-config-type-[TYPE_LABEL_VALUE]``)
-* Per node fence configuration (``fence-config-node-[NODE_NAME]``)
-
-Currently, only `type` label is supported.
-
-E.g.
-
-```yaml
-- kind: ConfigMap
-  apiVersion: v1
-  metadata:
-   name: fence-config-type-compute
-  data:
-   ...
-```
-
-overrides the default node fence configuration of all nodes with `type=compute` label
-unless more specific ``fence-config-node-[NODE_NAME]`` is available.
-
-### Fence CRD
-This is new proposed crd object in k8s cluster API server. The idea behind is:
-
-1. to allow the fence controller to be “stateless” - means that the crd will hold the fence operation state and if controller was restarted all the info to continue fence operation will be specified in those objects.
-1. to allow triggering jobs to perform actions and sign if they finished successfully or failed.
-
-```yaml
-apiVersion: ha.k8s.io/v1
-jobs:
-- gcloud-reset-inst-9cf8f46e-f44b-11e7-8977-68f728ac95ea
-- clean-pods-9d0b1321-f44b-11e7-8977-68f728ac95ea
-kind: NodeFence
-metadata:
-  clusterName: ""
-  creationTimestamp: 2018-01-08T08:11:03Z
-  generation: 0
-  name: node-fence-k8s-cluster-host1.usersys.redhat.com
-  namespace: ""
-  resourceVersion: "163898"
-  selfLink: /apis/ha.k8s.io/v1/node-fence-k8s-cluster-host1.usersys.redhat.com
-  uid: 77fdb386-f44b-11e7-bec9-001a4a16015a
-node: k8s-cluster-host1.usersys.redhat.com
-retries: 2
-status: Done
-step: Power-Management
-```
-- step can be isolation\power_managment\recover - this refer to the set of methods configured in the node fence configuration.
-- status is new, done, running, final or error - see Fence Controller management for each status.
-
-Flow example: controller saw non-response node and created new crd to fence the new, this initialized to “step: isolation” and current timestep. The controller create jobs related to the step and move status to running.
-- If node becomes “ready” in cluster, controller will change the crd to step:recovery and start triggering recovery jobs.
-
-After 5min (configurable) if node is still “not ready” controller will change to step:power_managment and status:new to start triggering pm jobs.
-
-### Pods treatment
-Pod treatment is done by “cluster fence agents” which will be run as part of a node fence treatment.
-
-Kubernetes follows taint-based-evictions. Taints and tolerations are ways to steer pods from nodes or evict pods that should stop.
-Pods states are changed once fence flow starts. Therefore, manual status change needs to be done:
-Fence pods treatment rules:
-- If storage fence was performed, all pods that used this storage can be deleted from the api server.
-- If power management for reboot the node ran - all node resources can be removed from cluster.
-
-In contrast to the autoscaler, the fence controller cannot control the re-scheduling load once a node is fenced (on scale down their controller gracefully treat the pods liveness). All resources are released at once, which can lead to overload and scale issues, which happens in parallel to the fence operation.
-
-Default node controller eviction policy doesn’t interfere with this logic. Evictions set the pod for terminating state until node is responsive to perform graceful shutdown. In pod treatment agents we will delete the pods’ objects only if the node does not get to ready and fenced. This action can trigger autoscaler to scale up the cluster when big overload is removed from specific node and immediately rescheduled.
-
-In power management fencing we usually expect the machine to come up again and re-join to the cluster. Therefore, we do not clean the node object, but leave it in “not ready” state bounded until connectivity is returned.
-
-Note: A fencing method can also remove the node from the cluster using the cloud provider API if configured.
-
-## To consider
-
-### Node problem detector
-
-Daemon which runs on each node, detects node problems and reports them to apiserver.
-The project lives under [https://github.com/kubernetes/node-problem-detector/](https://github.com/kubernetes/node-problem-detector/) repository.
-The node problem reports can be used to detect different misbehavior than just node going into "Unready" status.
-
-### Kdump integration
-When kdump enabled is set in node fence configuration the controller can check
-for kdump notifications once node becomes not ready. Once dumping is recognized,
-we can delete all pods.
-In parallel to waiting for kernel dumping the controller will start executing
-fence stage normally (admin should take care of configuring PM method to run after
-enough timeout to let the dumping finish).
-Kernel dumping is done by booting up node to kdump kernel that starts dumping
-to hard-coded fqdn reachable in cluster that save the dumping data.
-
-### Alternatives considered
-1. Create a new Cloud Provider allowing the autoscaler to function for
-   bare metal deployments.
-
-   This was considered however the existing APIs are load balancer
-   centric and hard to map to the concept of powering on and off nodes.
-
-   If the Cloud Provider API evolves in a compatible direction, it
-   might be advisable to persue a Bare Metal provider and have it be
-   responsible for much of the fencing configuration.
-
-1. A solution that focused exclusively on power fencing.
-
-   While this would dramatically simplify the configuration required,
-   many admins see power fencing as a last resort and would prefer
-   less destructive way to isolate a misbehaving node, such as network
-   and/or disk fencing.
-
-   We also see a desire from admins to use tools such as `kdump` to
-   obtain additional diagnostics, when possible, prior to powering off
-   the node.
-
-1. Attaching fencing configuration to nodes.
-
-   While it is tempting to add details on how to fence a node to the
-   kubernetes Node objects, this scales poorly from a maintenance
-   perspective, preventing nodes from sharing common methods (such as
-   `kdump`).
-
-   This is especially true for cloud deployments where all nodes are
-   controlled with the same credentials. However, even on bare metal
-   the only point of differention is often the the IP addresses of the
-   IPMI device, or the port number for a network switch, and it would
-   be advantageous to manage the rest in one place.
-
-### Roadmap
+## Roadmap
 
 Underway:
 
-* Implement the fence flow mechanism (state automaton) over GCE - using types configs
-* Implement the fence flow mechanism using fence agents for bare-metal support (focus on 1 or 2 PM devices)
-This will allow to demo full roll-out on cloud environments and bare-metal.
+* Implement the remedy controller monitoring node status
+* Specify a remedy configuration covering the most common use cases
+* Implement a remedy pod self-healing a node in AWS/GCE environment
+* Implement the fence flow mechanism for bare-metal support (focus on 1 or 2 PM devices)
 
 Would like to get soon:
 
-* CI tests
-* Demonstrate the fencing mechanism on AWS and GCE (optionally OpenStack)
-* Generate metrics based on the fence flow
-* Per set-of-nodes fencing configuration
+* Demonstrate the remedy mechanism on AWS and GCE (optionally OpenStack)
+* Demonstrate the mechanism on a bare metal provider (demonstrating how to work with node specific parameters)
+* Generate remedy metrics (how many times a network related remedy operation was run, how many times a node was restarted, how many times a node was removed)
 * Cluster fence policies applied
 
 Other possibilities:
 
+* Add mechanics to ease running of stateful remedy operations (allow to store last known state)
 * Consume events from the [Node problem detector](https://github.com/kubernetes/node-problem-detector)
 * Consume events/data from other source providing information about node behavior
